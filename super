@@ -1,0 +1,636 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Mon Obby 3D Web - Base de Départ</title>
+    
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            font-family: Arial, sans-serif;
+            background-color: #1a1a1a;
+            color: #eee;
+        }
+
+        canvas {
+            display: block;
+        }
+
+        .controls-info {
+            position: absolute;
+            bottom: 10px;
+            left: 10px;
+            background-color: rgba(0, 0, 0, 0.7);
+            padding: 10px 15px;
+            border-radius: 5px;
+            font-size: 0.9em;
+            z-index: 10;
+        }
+
+        .record-info {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            background-color: rgba(0, 0, 0, 0.7);
+            padding: 10px 15px;
+            border-radius: 5px;
+            font-size: 1.1em;
+            z-index: 10;
+            text-align: right;
+            line-height: 1.4;
+        }
+
+        .record-info span {
+            font-weight: bold;
+            color: #00ffcc;
+        }
+        
+        .cursor-hidden {
+            cursor: none;
+        }
+    </style>
+    
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/0.158.0/three.min.js"></script>
+</head>
+<body>
+    
+    <canvas id="gameCanvas"></canvas>
+
+    <div class="controls-info">
+        <h3>Contrôles :</h3>
+        <p>Cliquez sur l'écran pour démarrer et cacher le curseur.</p>
+        <p>W / S : Avancer / Reculer</p>
+        <p>A / D : Gauche / Droite</p>
+        <p>Espace : Sauter</p>
+    </div>
+
+    <div class="record-info">
+        <p>Distance Actuelle : <span id="currentDistance">0</span> m</p>
+        <p>Meilleur Record : <span id="highScore">0</span> m</p>
+    </div>
+
+    <script>
+        // --- Initialisation et Configuration ---
+        const scene = new THREE.Scene();
+        const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+        
+        // CORRECTION ÉCRAN NOIR : Ciblage de l'élément canvas
+        const canvasElement = document.getElementById('gameCanvas'); 
+        const renderer = new THREE.WebGLRenderer({ 
+            canvas: canvasElement,
+            antialias: true 
+        });
+
+        renderer.setSize(window.innerWidth, window.innerHeight);
+
+        // --- Ciel, Lumières et Atmosphère ---
+        scene.background = new THREE.Color(0x00aaff); 
+        scene.fog = new THREE.Fog(0x00aaff, 50, 200);
+
+        const hemisphereLight = new THREE.HemisphereLight(0x00aaff, 0x555555, 1.2); 
+        scene.add(hemisphereLight);
+
+        const directionalLight = new THREE.DirectionalLight(0xffffff, 1.5);
+        directionalLight.position.set(100, 100, 100).normalize();
+        scene.add(directionalLight);
+
+        // Matériau de base PBR forcé à être opaque
+        const BASE_MATERIAL = new THREE.MeshStandardMaterial({ 
+            metalness: 0.3, 
+            roughness: 0.7,
+            transparent: false, 
+            opacity: 1.0     
+        });
+        
+        const PLAYER_COLOR = 0xff0000; 
+        const PLAYER_BODY_MATERIAL = new THREE.MeshStandardMaterial({ color: PLAYER_COLOR, metalness: 0.1, roughness: 0.5 });
+        const BARBED_WIRE_COLOR = 0x333333; // Couleur pour les murs de la base
+        
+        // --- Personnage ---
+        let playerPhysicsHeight = 2.0; 
+        let playerHalfHeight = playerPhysicsHeight / 2; 
+        
+        const playerGroup = new THREE.Group();
+        playerGroup.position.y = 1.25; 
+
+        const bodyGeometry = new THREE.CylinderGeometry(0.5, 0.5, 2.0, 12); 
+        const body = new THREE.Mesh(bodyGeometry, PLAYER_BODY_MATERIAL);
+        body.position.y = 0; 
+        playerGroup.add(body);
+
+        const player = playerGroup; 
+        scene.add(player);
+
+        // --- Calcul dynamique de la hauteur de collision du joueur ---
+        player.traverse(function(child) {
+            if (child.isMesh) {
+                child.geometry.computeBoundingBox();
+                if (!player.boundingBox) player.boundingBox = new THREE.Box3();
+                player.boundingBox.union(child.geometry.boundingBox.clone().applyMatrix4(child.matrixWorld));
+            }
+        });
+        if (player.boundingBox) {
+            playerPhysicsHeight = player.boundingBox.max.y - player.boundingBox.min.y;
+            playerHalfHeight = playerPhysicsHeight / 2;
+        } else {
+            playerPhysicsHeight = 2.0;
+            playerHalfHeight = 1.0;
+        }
+
+        // Sol (Infini qui suit le joueur)
+        const groundGeometry = new THREE.PlaneGeometry(300, 300); 
+        const groundMaterial = new THREE.MeshStandardMaterial({ color: 0x4CAF50, side: THREE.DoubleSide });
+        const ground = new THREE.Mesh(groundGeometry, groundMaterial);
+        ground.rotation.x = Math.PI / 2;
+        scene.add(ground);
+
+        // --- Variables de Jeu et Génération ---
+        const platforms = [];
+        const trees = []; 
+        let startPlatform = null; 
+        
+        let lastZPosition = 0;
+        let lastYPosition = 0; 
+        let lastTreeZoneZ = -50; 
+        
+        // **CONSTANTES DE PHYSIQUE ET DE GÉNÉRATION**
+        const jumpForce = 14;         
+        const gravity = -22;         
+        const playerSpeed = 5;
+
+        const MAX_JUMP_RANGE_H = 5.0;    
+        const MAX_JUMP_HEIGHT = 2.0;    
+        const MIN_PLATFORM_DISTANCE = 3.0; 
+        const maxPlatforms = 8; 
+
+        const SAFE_ZONE_WIDTH = 7.5; 
+
+        // --- Variables de Score ---
+        let currentDistance = 0;
+        let highScore = localStorage.getItem('obbyHighScore') ? parseFloat(localStorage.getItem('obbyHighScore')) : 0;
+        document.getElementById('highScore').textContent = highScore.toFixed(1);
+
+
+        // Fonction utilitaire pour générer un nombre aléatoire
+        function getRandom(min, max) {
+            return Math.random() * (max - min) + min;
+        }
+
+        // --- Fonctions de Création ---
+        
+        function createPlatform(x, y, z, width, height, depth, color, isBaseWall = false) {
+            const geometry = new THREE.BoxGeometry(width, height, depth);
+            const material = BASE_MATERIAL.clone();
+            material.color.setHex(color);
+            
+            if (isBaseWall) {
+                material.metalness = 0.9;
+                material.roughness = 0.1;
+            }
+
+            const platform = new THREE.Mesh(geometry, material);
+            platform.position.set(x, y + height / 2, z); 
+            platform.userData.surfaceY = platform.position.y + height / 2; 
+            scene.add(platform);
+            platforms.push(platform);
+            return platform;
+        }
+
+        // Arbre (inchangé)
+        function createTree(x, z, scale = 1) {
+            const treeGroup = new THREE.Group();
+            
+            const trunkGeometry = new THREE.CylinderGeometry(0.3 * scale, 0.4 * scale, 3 * scale, 8);
+            const trunkMaterial = BASE_MATERIAL.clone();
+            trunkMaterial.color.setHex(0x8B4513);
+            const trunk = new THREE.Mesh(trunkGeometry, trunkMaterial);
+            trunk.position.y = (3 * scale) / 2;
+            treeGroup.add(trunk);
+            
+            const leavesGeometry = new THREE.IcosahedronGeometry(2 * scale, 1);
+            const leavesMaterial = BASE_MATERIAL.clone();
+            leavesMaterial.color.setHex(0x228B22);
+            const leaves = new THREE.Mesh(leavesGeometry, leavesMaterial);
+            leaves.position.y = 3 * scale + 1;
+            leaves.userData.isLeaves = true; 
+            treeGroup.add(leaves);
+
+            const yOffset = getRandom(-0.5, 0.5); 
+            treeGroup.position.set(x, yOffset, z); 
+            
+            scene.add(treeGroup);
+            trees.push(treeGroup);
+            return treeGroup;
+        }
+        
+        function createParticle(x, y, z) {
+            const geometry = new THREE.BoxGeometry(0.05, 0.01, 0.05);
+            const material = new THREE.MeshBasicMaterial({ color: 0xCCCC00 }); 
+            const particle = new THREE.Mesh(geometry, material);
+            
+            particle.position.set(x, y, z);
+            particle.userData.velocity = new THREE.Vector3(getRandom(-0.01, 0.01), getRandom(-0.05, -0.01), getRandom(-0.01, 0.01));
+            particle.userData.lifetime = 5; 
+            
+            scene.add(particle);
+            return particle;
+        }
+        
+        const particles = [];
+
+        // --- LOGIQUE DE GÉNÉRATION DE PLATEFORME GARANTIE ---
+        function spawnGuaranteedPlatform() {
+            
+            const minY = lastYPosition - 1.5; 
+            const maxY = lastYPosition + MAX_JUMP_HEIGHT; 
+            const newY = getRandom(minY, maxY); 
+            
+            const heightDifference = newY - lastYPosition;
+            let maxHorizontalDistance = MAX_JUMP_RANGE_H;
+
+            if (heightDifference > 0) {
+                const penaltyFactor = heightDifference / MAX_JUMP_HEIGHT; 
+                maxHorizontalDistance = MAX_JUMP_RANGE_H * (1 - penaltyFactor * 0.9); 
+                maxHorizontalDistance = Math.max(maxHorizontalDistance, MIN_PLATFORM_DISTANCE); 
+            } else {
+                maxHorizontalDistance = MAX_JUMP_RANGE_H;
+            }
+
+            const randomZOffset = getRandom(MIN_PLATFORM_DISTANCE, maxHorizontalDistance * 0.9);
+            const newZ = lastZPosition + randomZOffset;
+            
+            const newX = getRandom(-5, 5); 
+            const size = getRandom(1.5, 4);
+            const color = Math.floor(Math.random() * 0xffffff);
+            const platformHeight = 0.5;
+
+            const newPlatform = createPlatform(
+                newX, newY, newZ, size, platformHeight, size, color
+            );
+
+            lastZPosition = newZ;
+            lastYPosition = newPlatform.userData.surfaceY; 
+            return newPlatform;
+        }
+
+
+        // --- Création du Parcours Initial et de la Base de Départ ---
+        
+        // 1. Sol de la Base
+        const initialPlatformHeight = 0.5;
+        startPlatform = createPlatform(0, 0, 0, 8, initialPlatformHeight, 10, 0x00ccff); // Zone de 8x10
+        
+        // 2. Murs (Barbelés)
+        const wallHeight = 2.5;
+        const wallDepth = 0.3;
+        const wallY = 0;
+
+        // Mur Nord (Z positif)
+        createPlatform(0, wallY, 5, 8.6, wallHeight, wallDepth, BARBED_WIRE_COLOR, true);
+        // Mur Sud (Z négatif) - Le respawn se fait à Z=0, donc ce mur n'est pas nécessaire pour bloquer le recul
+        // createPlatform(0, wallY, -5, 8.6, wallHeight, wallDepth, BARBED_WIRE_COLOR, true); 
+        // Mur Ouest (X négatif)
+        createPlatform(-4.3, wallY, 0, wallDepth, wallHeight, 10, BARBED_WIRE_COLOR, true);
+        // Mur Est (X positif)
+        createPlatform(4.3, wallY, 0, wallDepth, wallHeight, 10, BARBED_WIRE_COLOR, true);
+
+        // 3. Plateforme d'Escalade pour Démarrer l'Obby (Escalier)
+        const firstJumpPlatform = createPlatform(0, 1.0, 6, 2, 0.5, 2, 0x00ff00);
+        
+        // 4. Positionnement initial du joueur
+        player.position.set(0, initialPlatformHeight/2 + playerHalfHeight + 0.1, 0); 
+
+        lastZPosition = firstJumpPlatform.position.z;
+        lastYPosition = firstJumpPlatform.userData.surfaceY;
+
+        // 5. Génération du reste du parcours
+        for (let i = 0; i < maxPlatforms; i++) {
+            spawnGuaranteedPlatform();
+        }
+
+
+        // --- Logique de Jeu et Contrôles ---
+        let keys = { w: false, a: false, s: false, d: false, space: false };
+        let verticalVelocity = 0;
+        let onGround = true;
+        let isGameActive = false;
+
+        let mouseSensitivity = 0.002;
+        let yaw = 0; 
+        let pitch = 0; 
+        let previousTime = performance.now();
+
+        const canvas = renderer.domElement;
+
+        canvas.addEventListener('click', () => {
+            canvas.requestPointerLock();
+        });
+
+        document.addEventListener('pointerlockchange', () => {
+            if (document.pointerLockElement === canvas) {
+                isGameActive = true;
+                document.body.classList.add('cursor-hidden');
+            } else {
+                isGameActive = false;
+                document.body.classList.remove('cursor-hidden');
+            }
+        });
+        
+        document.addEventListener('keydown', (event) => {
+            if (!isGameActive) return;
+            switch (event.key.toLowerCase()) {
+                case 'w': keys.w = true; break;
+                case 'a': keys.a = true; break;
+                case 's': keys.s = true; break;
+                case 'd': keys.d = true; break;
+                case ' ': 
+                    if (onGround) {
+                        verticalVelocity = jumpForce;
+                        onGround = false;
+                    }
+                    keys.space = true; 
+                    break;
+            }
+        });
+
+        document.addEventListener('keyup', (event) => {
+            if (!isGameActive) return;
+            switch (event.key.toLowerCase()) {
+                case 'w': keys.w = false; break;
+                case 'a': keys.a = false; break;
+                case 's': keys.s = false; break;
+                case 'd': keys.d = false; break;
+                case ' ': keys.space = false; break;
+            }
+        });
+
+        document.addEventListener('mousemove', (event) => {
+            if (!isGameActive) return;
+            yaw -= event.movementX * mouseSensitivity;
+            pitch -= event.movementY * mouseSensitivity;
+            
+            pitch = Math.max(-Math.PI / 4, Math.min(Math.PI / 4, pitch)); 
+        });
+
+        // --- Boucle d'Animation ---
+        function animate() {
+            requestAnimationFrame(animate);
+
+            const currentTime = performance.now();
+            const delta = (currentTime - previousTime) / 1000;
+            previousTime = currentTime;
+            
+            if (!isGameActive) {
+                renderer.render(scene, camera);
+                return;
+            }
+
+            // 1. Calcul du Mouvement
+            let direction = new THREE.Vector3();
+            let forward = new THREE.Vector3();
+            let right = new THREE.Vector3();
+
+            camera.getWorldDirection(forward);
+            forward.y = 0; 
+            forward.normalize();
+            
+            right.crossVectors(forward, new THREE.Vector3(0, 1, 0)); 
+
+            if (keys.w) direction.add(forward);
+            if (keys.s) direction.sub(forward);
+            if (keys.a) direction.sub(right);
+            if (keys.d) direction.add(right);
+
+            let moveVector = new THREE.Vector3();
+            if (direction.lengthSq() > 0) {
+                moveVector.copy(direction).normalize().multiplyScalar(playerSpeed * delta);
+            }
+            
+            let verticalMove = verticalVelocity * delta;
+            
+            
+            // 2. GESTION DES COLLISIONS HORIZONTALES (X, Z) - CORRIGÉ
+            let finalMoveVector = moveVector.clone();
+            player.updateMatrixWorld();
+            const playerCollisionBox = new THREE.Box3().setFromObject(player);
+
+            for (const platform of platforms) {
+                platform.updateMatrixWorld();
+                const platformBox = new THREE.Box3().setFromObject(platform);
+
+                // Permet au joueur de bouger librement si son bas est au-dessus du haut de la plateforme
+                const playerBottom = playerCollisionBox.min.y;
+                const platformTop = platformBox.max.y;
+                
+                // Si le bas du joueur est AU-DESSUS du haut de la plateforme (marge de 0.1), on ignore la collision horizontale.
+                if (playerBottom > platformTop - 0.1) {
+                    continue; 
+                }
+                
+                // Si la collision est possible (joueur à la même hauteur ou plus bas)
+                let futurePlayerBoxH = playerCollisionBox.clone();
+                futurePlayerBoxH.min.x += finalMoveVector.x;
+                futurePlayerBoxH.max.x += finalMoveVector.x;
+                futurePlayerBoxH.min.z += finalMoveVector.z;
+                futurePlayerBoxH.max.z += finalMoveVector.z;
+                
+                // S'il y a intersection, c'est une collision latérale.
+                if (futurePlayerBoxH.intersectsBox(platformBox)) {
+                    finalMoveVector.set(0, 0, 0); 
+                    break; 
+                }
+            }
+
+            // Appliquer le mouvement horizontal corrigé
+            player.position.x += finalMoveVector.x;
+            player.position.z += finalMoveVector.z;
+            
+            
+            // 3. GESTION DES COLLISIONS VERTICALES (Y)
+            onGround = false;
+            let collisionOccurred = false;
+
+            for (const platform of platforms) {
+                platform.updateMatrixWorld();
+                const platformBox = new THREE.Box3().setFromObject(platform);
+                
+                player.updateMatrixWorld();
+                const currentPlayerBox = new THREE.Box3().setFromObject(player); 
+
+                let futurePlayerBoxV = currentPlayerBox.clone();
+                futurePlayerBoxV.min.y += verticalMove;
+                futurePlayerBoxV.max.y += verticalMove;
+
+
+                if (futurePlayerBoxV.intersectsBox(platformBox)) {
+                    
+                    const platformTopY = platform.userData.surfaceY;
+                    const playerBottomYBefore = currentPlayerBox.min.y;
+                    
+                    // Collision d'atterrissage
+                    if (verticalVelocity <= 0 && playerBottomYBefore >= platformTopY - 0.01) { // Marge de 0.01 pour l'atterrissage
+                        
+                        verticalVelocity = 0;
+                        player.position.y = platformTopY + playerHalfHeight; 
+                        onGround = true;
+                        collisionOccurred = true;
+                        
+                        lastYPosition = platformTopY;
+                        break; 
+                    }
+                }
+            }
+            
+            // Appliquer le mouvement vertical ou la gravité
+            if (!collisionOccurred) {
+                player.position.y += verticalMove;
+                verticalVelocity += gravity * delta;
+            } else {
+                 verticalVelocity = 0;
+            }
+
+
+            // Le sol suit le joueur
+            ground.position.x = player.position.x;
+            ground.position.z = player.position.z;
+            
+            // --- Logique du Record de Distance et Respawn ---
+            if (player.position.z > 0) {
+                currentDistance = Math.floor(player.position.z);
+                document.getElementById('currentDistance').textContent = currentDistance;
+            }
+
+            const killVolumeY = -5;
+            if (player.position.y < killVolumeY) {
+                
+                if (currentDistance > highScore) {
+                    highScore = currentDistance;
+                    localStorage.setItem('obbyHighScore', highScore);
+                    document.getElementById('highScore').textContent = highScore;
+                }
+                
+                currentDistance = 0;
+                document.getElementById('currentDistance').textContent = 0;
+
+                // Respawn sur la Base de Départ
+                player.position.x = 0;
+                player.position.z = 0;
+                
+                const startPlatformHeight = startPlatform.geometry.parameters.height;
+                player.position.y = startPlatform.position.y + startPlatformHeight / 2 + playerHalfHeight + 0.1; 
+                
+                verticalVelocity = 0;
+                onGround = true; 
+                lastYPosition = startPlatform.userData.surfaceY; 
+
+                // --- Réinitialisation et Régénération des Plateformes ---
+                // On garde la Base, les Murs et le premier bloc de saut (index 0 à 4)
+                for (let i = platforms.length - 1; i >= 5; i--) { 
+                    const platform = platforms[i];
+                    scene.remove(platform);
+                    platforms.splice(i, 1);
+                }
+                lastZPosition = firstJumpPlatform.position.z;
+
+                for (let i = 0; i < maxPlatforms; i++) {
+                    spawnGuaranteedPlatform();
+                }
+            }
+            
+            // --- LOGIQUE DE GÉNÉRATION ET D'ANIMATION (Arbres et Particules) ---
+
+            if (lastZPosition - player.position.z < 25) {
+                spawnGuaranteedPlatform();
+            }
+            
+            const treeSpawnZone = player.position.z + 50; 
+            if (treeSpawnZone > lastTreeZoneZ) {
+                
+                const spawnCount = getRandom(5, 10); 
+                for (let i = 0; i < spawnCount; i++) {
+                    const treeZ = getRandom(lastTreeZoneZ, treeSpawnZone);
+                    
+                    let treeX;
+                    if (Math.random() < 0.5) {
+                        treeX = getRandom(-30, -SAFE_ZONE_WIDTH); 
+                    } else {
+                        treeX = getRandom(SAFE_ZONE_WIDTH, 30); 
+                    }
+                    
+                    createTree(treeX, treeZ, getRandom(0.8, 1.5)); 
+                }
+                
+                lastTreeZoneZ = treeSpawnZone;
+            }
+            
+            for (const tree of trees) {
+                if (Math.random() < 0.0005) { 
+                    const leaves = tree.children.find(child => child.userData.isLeaves);
+                    if (leaves) {
+                        const yPos = leaves.position.y + tree.position.y;
+                        const particle = createParticle(tree.position.x + getRandom(-1, 1), yPos, tree.position.z + getRandom(-1, 1));
+                        particles.push(particle);
+                    }
+                }
+            }
+
+            for (let i = particles.length - 1; i >= 0; i--) {
+                const p = particles[i];
+                p.position.add(p.userData.velocity); 
+                p.userData.velocity.y -= 0.001;
+                
+                p.rotation.x += 0.1 * delta;
+                p.rotation.y += 0.2 * delta;
+
+                p.userData.lifetime -= delta;
+
+                if (p.userData.lifetime <= 0 || p.position.y < ground.position.y) {
+                    scene.remove(p);
+                    particles.splice(i, 1);
+                }
+            }
+
+            for (let i = platforms.length - 1; i >= 0; i--) {
+                const platform = platforms[i];
+                if (platform === startPlatform) continue; 
+                if (player.position.z - platform.position.z > 15) {
+                    scene.remove(platform); 
+                    platforms.splice(i, 1);
+                }
+            }
+            
+            for (let i = trees.length - 1; i >= 0; i--) {
+                const tree = trees[i];
+                if (player.position.z - tree.position.z > 30) {
+                    scene.remove(tree); 
+                    trees.splice(i, 1);
+                }
+            }
+            // ---------------------------------------------------
+
+            // Mise à Jour de la Caméra 
+            player.rotation.y = yaw; 
+            const cameraDistance = 5;
+            
+            camera.position.x = player.position.x + Math.sin(yaw) * cameraDistance;
+            camera.position.z = player.position.z + Math.cos(yaw) * cameraDistance;
+            
+            camera.position.y = player.position.y + 2 - Math.sin(pitch) * cameraDistance * 0.5;
+
+            camera.lookAt(player.position);
+            
+            renderer.render(scene, camera);
+        }
+
+        animate();
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+    </script>
+</body>
+</html>
